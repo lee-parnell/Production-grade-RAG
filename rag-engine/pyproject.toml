@@ -1,0 +1,35 @@
+[project]
+name = "rag-engine"
+version = "0.1.0"
+description = "Production-style RAG engine with FastAPI and Streamlit"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.116.1",
+    "llama-index-core>=0.14.0",
+    "llama-index-readers-file>=0.5.4",
+    "openai>=1.107.0",
+    "pydantic>=2.11.7",
+    "python-dotenv>=1.1.1",
+    "qdrant-client>=1.15.1",
+    "requests>=2.32.5",
+    "streamlit>=1.49.1",
+    "uvicorn>=0.35.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=8.4.1",
+    "ruff>=0.12.10",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
