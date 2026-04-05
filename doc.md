@@ -63,14 +63,14 @@
 
 ### Step 1: Start Streamlit (Frontend)
 ```powershell
-d:/ProductionGradeRAGPythonApp-main/.venv/Scripts/python.exe -m streamlit run streamlit_app.py
+d:/Production-grade-RAG/.venv/Scripts/python.exe -m streamlit run streamlit_app.py
 # Opens http://127.0.0.1:8501 in your browser
 ```
 
 ### Step 2: Start FastAPI Backend (Optional — for Inngest workflows)
 ```powershell
 $env:INNGEST_DEV='1'
-d:/ProductionGradeRAGPythonApp-main/.venv/Scripts/python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000
+d:/Production-grade-RAG/.venv/Scripts/python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000
 # Runs on http://127.0.0.1:8000
 ```
 

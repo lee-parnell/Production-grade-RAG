@@ -342,7 +342,7 @@ def _render_inngest_preflight() -> None:
     st.code(
         "# 1) Start FastAPI (same venv as this app)\n"
         "$env:INNGEST_DEV='1'\n"
-        "d:/ProductionGradeRAGPythonApp-main/.venv/Scripts/python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000\n\n"
+        "python -m uvicorn main:app --host 127.0.0.1 --port 8000\n\n"
         "# 2) Start Inngest Dev Server (npx)\n"
         "npx --ignore-scripts=false inngest-cli@latest dev -u http://127.0.0.1:8000/api/inngest --no-discovery\n\n"
         "# 2b) Docker fallback if npx is unavailable\n"
