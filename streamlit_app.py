@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from pathlib import Path
 import time
@@ -226,6 +227,13 @@ def save_uploaded_pdf(file) -> Path:
     return file_path
 
 
+def _source_hint() -> str | None:
+    hint = st.session_state.get("last_uploaded_source")
+    if isinstance(hint, str) and hint.strip():
+        return hint.strip()
+    return None
+
+
 async def send_rag_ingest_event(pdf_path: Path) -> None:
     client = get_inngest_client()
     await client.send(
@@ -239,15 +247,18 @@ async def send_rag_ingest_event(pdf_path: Path) -> None:
     )
 
 
-async def send_rag_query_event(question: str, top_k: int) -> str:
+async def send_rag_query_event(question: str, top_k: int, source_hint: str | None = None) -> str:
     client = get_inngest_client()
+    payload = {
+        "question": question,
+        "top_k": top_k,
+    }
+    if source_hint:
+        payload["source_hint"] = source_hint
     result = await client.send(
         inngest.Event(
             name="rag/query_pdf_ai",
-            data={
-                "question": question,
-                "top_k": top_k,
-            },
+            data=payload,
         )
     )
     return result[0]
@@ -268,6 +279,17 @@ def _is_send_events_error(exc: Exception) -> bool:
 
 
 def _run_ingest_locally(pdf_path: Path) -> int:
+    backend_payload = _post_backend_json(
+        "/api/local-ingest",
+        {
+            "pdf_path": str(pdf_path.resolve()),
+            "source_id": pdf_path.name,
+        },
+        timeout=120,
+    )
+    if isinstance(backend_payload, dict) and isinstance(backend_payload.get("ingested"), int):
+        return int(backend_payload["ingested"])
+
     chunks = load_and_chunk_pdf(str(pdf_path.resolve()))
     vectors = embed_texts(chunks)
     source_id = pdf_path.name
@@ -277,7 +299,23 @@ def _run_ingest_locally(pdf_path: Path) -> int:
     return len(chunks)
 
 
-def _run_query_locally(question: str, top_k: int) -> dict:
+def _run_query_locally(question: str, top_k: int, source_hint: str | None = None) -> dict:
+    backend_query_payload = {"question": question, "top_k": int(top_k)}
+    if source_hint:
+        backend_query_payload["source_hint"] = source_hint
+
+    backend_payload = _post_backend_json(
+        "/api/local-query-ai",
+        backend_query_payload,
+        timeout=120,
+    )
+    if isinstance(backend_payload, dict) and "answer" in backend_payload:
+        return {
+            "answer": backend_payload.get("answer", ""),
+            "sources": backend_payload.get("sources", []),
+            "num_contexts": int(backend_payload.get("num_contexts", 0)),
+        }
+
     query_vec = embed_texts([question])[0]
     found = get_qdrant_storage().search(query_vec, top_k)
     context_block = "\n\n".join(f"- {chunk}" for chunk in found["contexts"])
@@ -299,6 +337,37 @@ def _run_query_locally(question: str, top_k: int) -> dict:
     }
 
 
+def _run_query_context_only(question: str, top_k: int, source_hint: str | None = None) -> dict:
+    backend_query_payload = {"question": question, "top_k": int(top_k)}
+    if source_hint:
+        backend_query_payload["source_hint"] = source_hint
+
+    backend_payload = _post_backend_json(
+        "/api/local-query-context",
+        backend_query_payload,
+        timeout=60,
+    )
+    if isinstance(backend_payload, dict) and "answer" in backend_payload:
+        return {
+            "answer": backend_payload.get("answer", ""),
+            "sources": backend_payload.get("sources", []),
+            "num_contexts": int(backend_payload.get("num_contexts", 0)),
+        }
+
+    query_vec = embed_texts([question])[0]
+    found = get_qdrant_storage().search(query_vec, top_k)
+    contexts = found.get("contexts", [])
+    if not contexts:
+        answer = "I could not find relevant context in indexed documents for this question."
+    else:
+        answer = f"Based on retrieved context: {contexts[0][:900]}"
+    return {
+        "answer": answer,
+        "sources": found.get("sources", []),
+        "num_contexts": len(contexts),
+    }
+
+
 def _local_fallback_help() -> str:
     return (
         "Local fallback requires a configured model provider. "
@@ -306,6 +375,22 @@ def _local_fallback_help() -> str:
         "Examples: OPENAI_API_KEY for openai, or OLLAMA_BASE_URL and OLLAMA_API_KEY for ollama. "
         "Also ensure vector storage is reachable via QDRANT_URL, or set QDRANT_PATH for embedded local storage."
     )
+
+
+def _fastapi_base_url() -> str:
+    return os.getenv("FASTAPI_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+
+
+def _post_backend_json(path: str, payload: dict, timeout: float) -> dict | None:
+    try:
+        response = requests.post(f"{_fastapi_base_url()}{path}", json=payload, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        return None
+    return None
 
 
 def _inngest_api_base() -> str:
@@ -356,24 +441,83 @@ def fetch_runs(event_id: str) -> list[dict]:
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-    return data.get("data", [])
+    if isinstance(data, dict):
+        if isinstance(data.get("data"), list):
+            return data["data"]
+        if isinstance(data.get("runs"), list):
+            return data["runs"]
+    return []
 
 
-def wait_for_run_output(event_id: str, timeout_s: float = 120.0, poll_interval_s: float = 0.5) -> dict:
+def _normalized_status(status: object) -> str:
+    return str(status or "").strip().lower()
+
+
+def _extract_run_output(run: dict) -> dict:
+    output = run.get("output")
+    if isinstance(output, dict):
+        return output
+    if isinstance(output, str):
+        try:
+            parsed = json.loads(output)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+def _pick_best_run(runs: list[dict]) -> dict:
+    if not runs:
+        return {}
+
+    terminal_statuses = {"completed", "succeeded", "success", "finished", "failed", "cancelled", "canceled", "errored", "error"}
+
+    # Prefer run with output first.
+    for run in runs:
+        if _extract_run_output(run):
+            return run
+
+    # Prefer terminal run if available.
+    for run in runs:
+        if _normalized_status(run.get("status")) in terminal_statuses:
+            return run
+
+    # Fallback to first run returned by API.
+    return runs[0]
+
+
+def wait_for_run_output(event_id: str, timeout_s: float | None = None, poll_interval_s: float = 0.5) -> dict:
+    if timeout_s is None:
+        timeout_s = float(os.getenv("INNGEST_RUN_TIMEOUT_S", "60"))
+
     start = time.time()
     last_status = None
+    poll_count = 0
     while True:
         runs = fetch_runs(event_id)
         if runs:
-            run = runs[0]
-            status = run.get("status")
-            last_status = status or last_status
-            if status in ("Completed", "Succeeded", "Success", "Finished"):
-                return run.get("output") or {}
-            if status in ("Failed", "Cancelled"):
+            run = _pick_best_run(runs)
+            status = _normalized_status(run.get("status"))
+            if status:
+                last_status = status
+
+            # Check for failure immediately.
+            if status in {"failed", "cancelled", "canceled", "errored", "error"}:
                 raise RuntimeError(f"Function run {status}")
-        if time.time() - start > timeout_s:
-            raise TimeoutError(f"Timed out waiting for run output (last status: {last_status})")
+
+            # Some Inngest responses may populate output before terminal status.
+            output = _extract_run_output(run)
+            if output and isinstance(output, dict) and output.get("answer"):
+                return output
+
+            if status in {"completed", "succeeded", "success", "finished"}:
+                return output if output else {}
+
+        poll_count += 1
+        elapsed = time.time() - start
+        if elapsed > timeout_s:
+            raise TimeoutError(f"Timed out waiting for run output after {poll_count} polls (last status: {last_status})")
         time.sleep(poll_interval_s)
 
 
@@ -384,6 +528,7 @@ uploaded = st.file_uploader("Choose a PDF", type=["pdf"], accept_multiple_files=
 if uploaded is not None:
     with st.spinner("Uploading and triggering ingestion..."):
         path = save_uploaded_pdf(uploaded)
+        st.session_state["last_uploaded_source"] = path.name
         if not _inngest_enabled():
             try:
                 ingested = _run_ingest_locally(path)
@@ -420,9 +565,10 @@ with st.form("rag_query_form"):
 
     if submitted and question.strip():
         with st.spinner("Sending event and generating answer..."):
+            source_hint = _source_hint()
             if not _inngest_enabled():
                 try:
-                    output = _run_query_locally(question.strip(), int(top_k))
+                    output = _run_query_locally(question.strip(), int(top_k), source_hint=source_hint)
                     st.subheader("Answer")
                     st.write(output.get("answer", "") or "(No answer)")
                     sources = output.get("sources", [])
@@ -435,7 +581,7 @@ with st.form("rag_query_form"):
                     st.info(_local_fallback_help())
                 st.stop()
             try:
-                event_id = asyncio.run(send_rag_query_event(question.strip(), int(top_k)))
+                event_id = asyncio.run(send_rag_query_event(question.strip(), int(top_k), source_hint=source_hint))
                 output = wait_for_run_output(event_id)
                 answer = output.get("answer", "")
                 sources = output.get("sources", [])
@@ -448,13 +594,25 @@ with st.form("rag_query_form"):
                         st.write(f"- {s}")
             except requests.RequestException as exc:
                 st.error(f"Failed to read Inngest run output: {exc}")
-            except TimeoutError as exc:
-                st.error(str(exc))
+            except (TimeoutError, RuntimeError) as exc:
+                st.warning(f"{exc}. Falling back to context-only retrieval mode.")
+                try:
+                    output = _run_query_context_only(question.strip(), int(top_k), source_hint=source_hint)
+                    st.subheader("Answer")
+                    st.write(output.get("answer", "") or "(No answer)")
+                    sources = output.get("sources", [])
+                    if sources:
+                        st.caption("Sources")
+                        for s in sources:
+                            st.write(f"- {s}")
+                except Exception as local_exc:
+                    st.error(f"Context-only fallback failed: {local_exc}")
+                    st.info(_local_fallback_help())
             except Exception as exc:
                 if _is_send_events_error(exc):
                     st.warning(_send_error_message(exc))
                     try:
-                        output = _run_query_locally(question.strip(), int(top_k))
+                        output = _run_query_locally(question.strip(), int(top_k), source_hint=source_hint)
                         st.subheader("Answer")
                         st.write(output.get("answer", "") or "(No answer)")
                         sources = output.get("sources", [])

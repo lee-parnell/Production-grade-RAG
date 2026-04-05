@@ -6,6 +6,7 @@ import os
 import requests
 import hashlib
 import importlib
+import re
 
 load_dotenv()
 
@@ -69,9 +70,19 @@ def _hash_embedding(text: str, dim: int) -> list[float]:
 
 splitter = SentenceSplitter(chunk_size=1000, chunk_overlap=200)
 
+
+def _normalize_pdf_text(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = text.replace("\u00a0", " ").replace("\ufeff", " ")
+    cleaned = re.sub(r"\b(?:[A-Za-z]\s+){2,}[A-Za-z]\b", lambda m: m.group(0).replace(" ", ""), cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
 def load_and_chunk_pdf(path: str):
     docs = PDFReader().load_data(file=path)
-    texts = [d.text for d in docs if getattr(d, "text", None)]
+    texts = [_normalize_pdf_text(d.text) for d in docs if getattr(d, "text", None)]
     chunks = []
     for t in texts:
         chunks.extend(splitter.split_text(t))

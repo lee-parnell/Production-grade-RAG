@@ -12,6 +12,18 @@ class QdrantStorage:
             return 768
         return 3072
 
+    @staticmethod
+    def _create_local_client(path: str) -> QdrantClient:
+        try:
+            return QdrantClient(path=path)
+        except RuntimeError as exc:
+            # Embedded Qdrant is single-process for a given path.
+            if "already accessed by another instance" not in str(exc):
+                raise
+            fallback_path = f"{path}_pid_{os.getpid()}"
+            os.makedirs(fallback_path, exist_ok=True)
+            return QdrantClient(path=fallback_path)
+
     def __init__(self, url=None, collection=None, dim=None):
         url = url or os.getenv("QDRANT_URL", "http://localhost:6333")
         collection = collection or os.getenv("QDRANT_COLLECTION", "docs")
@@ -23,7 +35,7 @@ class QdrantStorage:
             self.client = QdrantClient(url=url, timeout=30)
             self.client.get_collections()
         except Exception:
-            self.client = QdrantClient(path=local_path)
+            self.client = self._create_local_client(local_path)
 
         self.collection = collection
         if not self.client.collection_exists(self.collection):
@@ -54,16 +66,25 @@ class QdrantStorage:
             results = response.points
         contexts = []
         sources = set()
+        records = []
 
         for r in results:
             payload = getattr(r, "payload", None) or {}
             text = payload.get("text", "")
             source = payload.get("source", "")
+            score = getattr(r, "score", None)
             if text:
                 contexts.append(text)
                 sources.add(source)
+                records.append(
+                    {
+                        "text": text,
+                        "source": source,
+                        "score": float(score) if score is not None else None,
+                    }
+                )
 
-        return {"contexts": contexts, "sources": list(sources)}
+        return {"contexts": contexts, "sources": list(sources), "records": records}
 
     def close(self):
         try:
